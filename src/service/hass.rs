@@ -730,18 +730,37 @@ pub async fn spawn_hass_integration(
             // This would require a feature request to the library
         }
     }
-    client
-        .connect(
-            &mqtt_host,
-            mqtt_port.into(),
-            Duration::from_secs(120),
-            args.mqtt_bind_address.as_deref(),
-        )
-        .await
-        .with_context(|| {
-            let protocol = if args.mqtt_use_tls() { "mqtts" } else { "mqtt" };
-            format!("connecting to {protocol} broker {mqtt_host}:{mqtt_port}")
-        })?;
+
+    let protocol = if args.mqtt_use_tls() { "mqtts" } else { "mqtt" };
+    let mut connected = false;
+    for _ in 0..30 {
+        log::info!("Attempting connection to {protocol} broker {mqtt_host}:{mqtt_port}...");
+        match client
+            .connect(
+                &mqtt_host,
+                mqtt_port.into(),
+                Duration::from_secs(120),
+                args.mqtt_bind_address.as_deref(),
+            )
+            .await
+        {
+            Ok(status) => {
+                log::info!("Connected to {protocol} broker {mqtt_host}:{mqtt_port}, status={status}");
+                connected = true;
+                break;
+            }
+            Err(err) => {
+                log::error!("Failed to connect to {protocol} broker {mqtt_host}:{mqtt_port}: {err:#}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    anyhow::ensure!(
+        connected,
+        "Failed to connect to {protocol} broker after several attempts"
+    );
+
     let subscriber = client.subscriber().expect("to own the subscriber");
 
     state
@@ -771,8 +790,12 @@ pub async fn spawn_hass_integration(
 }
 
 pub fn camel_case_to_space_separated(camel: &str) -> String {
-    let mut result = camel[..1].to_ascii_uppercase();
-    for c in camel.chars().skip(1) {
+    let mut chars = camel.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut result = first.to_ascii_uppercase().to_string();
+    for c in chars {
         if c.is_uppercase() {
             result.push(' ');
         }
@@ -782,7 +805,7 @@ pub fn camel_case_to_space_separated(camel: &str) -> String {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
     #[test]
@@ -792,6 +815,24 @@ mod test {
             camel_case_to_space_separated("oscillationToggle"),
             "Oscillation Toggle"
         );
+    }
+
+    #[test]
+    fn test_camel_case_chinese_no_panic() {
+        assert_eq!(
+            camel_case_to_space_separated("用于三灯头中的第二个"),
+            "用于三灯头中的第二个"
+        );
+    }
+
+    #[test]
+    fn test_camel_case_empty() {
+        assert_eq!(camel_case_to_space_separated(""), "");
+    }
+
+    #[test]
+    fn test_camel_case_emoji() {
+        assert_eq!(camel_case_to_space_separated("🔥lightMode"), "🔥light Mode");
     }
 
     #[test]

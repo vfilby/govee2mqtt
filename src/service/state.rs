@@ -1,6 +1,6 @@
 use crate::ble::{Base64HexBytes, SetHumidifierMode, SetHumidifierNightlightParams};
 use crate::lan_api::{Client as LanClient, DeviceStatus as LanDeviceStatus, LanDevice};
-use crate::platform_api::{DeviceCapability, GoveeApiClient};
+use crate::platform_api::{DeviceCapability, DeviceType, GoveeApiClient};
 use crate::service::coordinator::Coordinator;
 use crate::service::device::Device;
 use crate::service::hass::{topic_safe_id, HassClient};
@@ -53,7 +53,7 @@ impl State {
 
     /// Returns a mutable version of the specified device, creating
     /// an entry for it if necessary.
-    pub async fn device_mut(&self, sku: &str, id: &str) -> MappedMutexGuard<Device> {
+    pub async fn device_mut(&self, sku: &str, id: &str) -> MappedMutexGuard<'_, Device> {
         let devices = self.devices_by_id.lock().await;
         MutexGuard::map(devices, |devices| {
             devices
@@ -219,6 +219,15 @@ impl State {
 
     pub async fn poll_platform_api(self: &Arc<Self>, device: &Device) -> anyhow::Result<bool> {
         if let Some(client) = self.get_platform_client().await {
+            if let DeviceType::Other(other) = &device.device_type() {
+                // Cannot poll an unknown device
+                // <https://github.com/wez/govee2mqtt/issues/391>
+                // <https://github.com/wez/govee2mqtt/issues/501>
+                // <https://github.com/wez/govee2mqtt/issues/394>
+                log::trace!("device {device} cannot be polled because it has type Other: {other}");
+                return Ok(false);
+            }
+
             let device_state = device.device_state();
             log::info!("requesting update via Platform API {device} {device_state:?}");
             if let Some(info) = &device.http_device_info {

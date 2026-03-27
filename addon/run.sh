@@ -4,21 +4,40 @@ export RUST_BACKTRACE=full
 export RUST_LOG_STYLE=always
 export XDG_CACHE_HOME=/data
 
-if bashio::services.available mqtt ; then
+wait_for_mqtt() {
+  local max_attempts=30
+  local attempt=1
+
+  bashio::log.info "mqtt_host was not explicitly configured, waiting for the Mosquitto broker Add-on to become available"
+
+  while [ $attempt -le $max_attempts ]; do
+    if bashio::services.available mqtt ; then
+      if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$(bashio::services mqtt host)/$(bashio::services mqtt port)" 2>/dev/null; then
+        bashio::log.info "MQTT broker is ready!"
+        return 0
+      fi
+    fi
+
+    bashio::log.info "MQTT broker not ready yet (attempt ${attempt}/${max_attempts}), waiting 2 seconds..."
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+
+  bashio::log.error "MQTT broker did not become available after ${max_attempts} attempts"
+  return 1
+}
+
+if bashio::config.has_value mqtt_host ; then
+  export GOVEE_MQTT_HOST="$(bashio::config mqtt_host)"
+else
+  if ! wait_for_mqtt ; then
+    bashio::exit.nok "Mosquitto MQTT broker is not available"
+  fi
   export GOVEE_MQTT_HOST="$(bashio::services mqtt 'host')"
   export GOVEE_MQTT_PORT="$(bashio::services mqtt 'port')"
   export GOVEE_MQTT_USER="$(bashio::services mqtt 'username')"
   export GOVEE_MQTT_PASSWORD="$(bashio::services mqtt 'password')"
 fi
-
-if bashio::config.has_value hub_ip ; then
-  export GOVEE_HUB_IP="$(bashio::config hub_ip)"
-fi
-
-if bashio::config.has_value mqtt_host ; then
-  export GOVEE_MQTT_HOST="$(bashio::config mqtt_host)"
-fi
-
 
 if bashio::config.has_value mqtt_port ; then
   export GOVEE_MQTT_PORT="$(bashio::config mqtt_port)"

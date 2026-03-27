@@ -6,7 +6,7 @@ use anyhow::Context;
 use if_addrs::IfAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -48,7 +48,7 @@ pub struct LanDiscoArguments {
     /// IP addresses. Can be specified multiple times.
     /// You may also set GOVEE_LAN_SCAN=10.0.0.1,10.0.0.2 via the environment.
     #[arg(long, global = true)]
-    pub scan: Vec<IpAddr>,
+    pub scan: Vec<String>,
 
     /// How long to wait for discovery to complete, in seconds
     /// You may also set GOVEE_LAN_DISCO_TIMEOUT via the environment.
@@ -76,9 +76,10 @@ pub fn truthy(s: &str) -> anyhow::Result<bool> {
 
 impl LanDiscoArguments {
     pub fn to_disco_options(&self) -> anyhow::Result<DiscoOptions> {
+        let mut scan_names = self.scan.clone();
         let mut options = DiscoOptions {
             enable_multicast: !self.no_multicast,
-            additional_addresses: self.scan.clone(),
+            additional_addresses: vec![],
             broadcast_all_interfaces: self.broadcast_all,
             global_broadcast: self.global_broadcast,
         };
@@ -97,11 +98,28 @@ impl LanDiscoArguments {
 
         if let Some(v) = opt_env_var::<String>("GOVEE_LAN_SCAN")? {
             for addr in v.split(',') {
-                let ip = addr
-                    .trim()
-                    .parse()
-                    .with_context(|| format!("parsing {v} as IpAddr"))?;
-                options.additional_addresses.push(ip);
+                scan_names.push(addr.trim().to_string());
+            }
+        }
+
+        for name in scan_names {
+            match name.parse::<IpAddr>() {
+                Ok(addr) => {
+                    options.additional_addresses.push(addr);
+                }
+                Err(err1) => match (name.as_str(), SCAN_PORT).to_socket_addrs() {
+                    Ok(addrs) => {
+                        for a in addrs {
+                            options.additional_addresses.push(a.ip());
+                        }
+                    }
+                    Err(err2) => {
+                        anyhow::bail!(
+                            "{name} could not be parsed as either an \
+                            IpAddr ({err1:#}) or a DNS name ({err2:#}"
+                        );
+                    }
+                },
             }
         }
 
@@ -176,8 +194,13 @@ struct RequestMessage {
     msg: Request,
 }
 
+fn unspec_ip() -> IpAddr {
+    Ipv4Addr::UNSPECIFIED.into()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
 pub struct LanDevice {
+    #[serde(default = "unspec_ip")]
     pub ip: IpAddr,
     pub device: String,
     pub sku: String,
@@ -453,8 +476,24 @@ async fn lan_disco(
             String::from_utf8_lossy(data)
         );
 
-        let response: ResponseWrapper = from_json(data)
+        let mut response: ResponseWrapper = from_json(data)
             .with_context(|| format!("Parsing: {}", String::from_utf8_lossy(data)))?;
+
+        // This is frustrating; some newer devices don't emit the ip field
+        // as defined in the spec.  What we do to deal with this is default
+        // the ip to the v4 unspecified address during deserialization and
+        // check for it here. We'll assume that the ip to use is the ip
+        // from which we got the scan response.
+        // <https://github.com/wez/govee2mqtt/issues/437>
+        if let Response::Scan(dev) = &mut response.msg {
+            if dev.ip.is_unspecified() {
+                dev.ip = addr.ip();
+            } else if dev.ip != addr.ip() {
+                log::warn!(
+                    "Got scan packet from {addr:?} which has ip set to a different device {dev:?}"
+                );
+            }
+        }
 
         let mut mux = inner.mux.lock().await;
         mux.retain(|l| !l.tx.is_closed());

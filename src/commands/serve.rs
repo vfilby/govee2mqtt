@@ -1,10 +1,13 @@
 use crate::lan_api::Client as LanClient;
+use crate::platform_api::GoveeApiClient;
 use crate::service::device::Device;
 use crate::service::hass::spawn_hass_integration;
 use crate::service::http::run_http_server;
 use crate::service::iot::start_iot_client;
 use crate::service::state::StateHandle;
+use crate::undoc_api::GoveeUndocumentedApi;
 use crate::version_info::govee_version;
+use crate::UndocApiArguments;
 use anyhow::Context;
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -27,6 +30,26 @@ async fn poll_single_device(state: &StateHandle, device: &Device) -> anyhow::Res
     if device.is_ble_only_device() == Some(true) {
         // We can't poll this device, we have no ble support
         return Ok(());
+    }
+
+    // Collect the device status via the LAN API, if possible.
+    // This is partially redundant with the LAN discovery task,
+    // but the timing of that is not as regular and predictable
+    // because it employs exponential backoff.
+    // Some Govee devices have bad firmware that will cause the
+    // lights to flicker about a minute after polling, so it
+    // is desirable to keep polling on a regular basis.
+    // <https://github.com/wez/govee2mqtt/issues/250>
+    if let Some(lan_device) = &device.lan_device {
+        if let Some(client) = state.get_lan_client().await {
+            if let Ok(status) = client.query_status(lan_device).await {
+                state
+                    .device_mut(&lan_device.sku, &lan_device.device)
+                    .await
+                    .set_lan_device_status(status);
+                state.notify_of_state_change(&lan_device.device).await.ok();
+            }
+        }
     }
 
     let poll_interval = device.preferred_poll_interval();
@@ -81,9 +104,72 @@ async fn periodic_state_poll(state: StateHandle) -> anyhow::Result<()> {
             }
         }
 
-        sleep(Duration::from_secs(60)).await;
+        sleep(Duration::from_secs(30)).await;
     }
 }
+
+async fn enumerate_devices_via_platform_api(
+    state: StateHandle,
+    client: Option<GoveeApiClient>,
+) -> anyhow::Result<()> {
+    let client = match client {
+        Some(client) => client,
+        None => match state.get_platform_client().await {
+            Some(client) => client,
+            None => return Ok(()),
+        },
+    };
+
+    log::info!("Querying platform API for device list");
+    for info in client.get_devices().await? {
+        let mut device = state.device_mut(&info.sku, &info.device).await;
+        device.set_http_device_info(info);
+    }
+    Ok(())
+}
+
+async fn enumerate_devices_via_undo_api(
+    state: StateHandle,
+    client: Option<GoveeUndocumentedApi>,
+    args: &UndocApiArguments,
+) -> anyhow::Result<()> {
+    let (client, needs_start) = match client {
+        Some(client) => (client, true),
+        None => match state.get_undoc_client().await {
+            Some(client) => (client, false),
+            None => return Ok(()),
+        },
+    };
+
+    log::info!("Querying undocumented API for device + room list");
+    let acct = client.login_account_cached().await?;
+    let info = client.get_device_list(&acct.token).await?;
+    let mut group_by_id = HashMap::new();
+    for group in info.groups {
+        group_by_id.insert(group.group_id, group.group_name);
+    }
+    for entry in info.devices {
+        let mut device = state.device_mut(&entry.sku, &entry.device).await;
+        let room_name = group_by_id.get(&entry.group_id).map(|name| name.as_str());
+        device.set_undoc_device_info(entry, room_name);
+    }
+
+    if needs_start {
+        start_iot_client(args, state.clone(), Some(acct)).await?;
+    }
+    Ok(())
+}
+
+const ISSUE_76_EXPLANATION: &str = "Startup cannot automatically continue because entity names\n\
+    could become inconsistent especially across frequent similar\n\
+    intermittent issues if/as they occur on an ongoing basis.\n\
+    Please see https://github.com/wez/govee2mqtt/issues/76\n\
+    A workaround is to remove the Govee API credentials from your\n\
+    configuration, which will cause this govee2mqtt to use only\n\
+    the LAN API. Two consequences of that will be loss of control\n\
+    over devices that do not support the LAN API, and also devices\n\
+    changing entity ID to less descriptive names due to lack of\n\
+    metadata availability via the LAN API.";
 
 impl ServeCommand {
     pub async fn run(&self, args: &crate::Args) -> anyhow::Result<()> {
@@ -94,34 +180,63 @@ impl ServeCommand {
         // their names.
 
         if let Ok(client) = args.api_args.api_client() {
-            log::info!("Querying platform API for device list");
-            for info in client.get_devices().await? {
-                let mut device = state.device_mut(&info.sku, &info.device).await;
-                device.set_http_device_info(info);
+            if let Err(err) =
+                enumerate_devices_via_platform_api(state.clone(), Some(client.clone())).await
+            {
+                anyhow::bail!(
+                    "Error during initial platform API discovery: {err:#}\n{ISSUE_76_EXPLANATION}"
+                );
             }
 
+            // only record the client after we've completed the
+            // initial platform disco attempt
             state.set_platform_client(client).await;
+
+            // spawn periodic discovery task
+            let state = state.clone();
+            tokio::spawn(async move {
+                loop {
+                    sleep(Duration::from_secs(600)).await;
+                    if let Err(err) = enumerate_devices_via_platform_api(state.clone(), None).await
+                    {
+                        log::error!("Error during periodic platform API discovery: {err:#}");
+                    }
+                }
+            });
         }
         if let Ok(client) = args.undoc_args.api_client() {
-            log::info!("Querying undocumented API for device + room list");
-            let acct = client.login_account_cached().await?;
-            let info = client.get_device_list(&acct.token).await?;
-            let mut group_by_id = HashMap::new();
-            for group in info.groups {
-                group_by_id.insert(group.group_id, group.group_name);
-            }
-            for entry in info.devices {
-                let mut device = state.device_mut(&entry.sku, &entry.device).await;
-                let room_name = group_by_id.get(&entry.group_id).map(|name| name.as_str());
-                device.set_undoc_device_info(entry, room_name);
+            if let Err(err) = enumerate_devices_via_undo_api(
+                state.clone(),
+                Some(client.clone()),
+                &args.undoc_args,
+            )
+            .await
+            {
+                anyhow::bail!(
+                    "Error during initial undoc API discovery: {err:#}\n{ISSUE_76_EXPLANATION}"
+                );
             }
 
-            start_iot_client(args, state.clone(), Some(acct)).await?;
-
+            // only record the client after we've completed the
+            // initial undoc disco attempt
             state.set_undoc_client(client).await;
+
+            // spawn periodic discovery task
+            let state = state.clone();
+            let args = args.undoc_args.clone();
+            tokio::spawn(async move {
+                loop {
+                    sleep(Duration::from_secs(600)).await;
+                    if let Err(err) =
+                        enumerate_devices_via_undo_api(state.clone(), None, &args).await
+                    {
+                        log::error!("Error during periodic undoc API discovery: {err:#}");
+                    }
+                }
+            });
         }
 
-        // Now start discovery
+        // Now start LAN discovery
 
         let options = args.lan_disco_args.to_disco_options()?;
         if !options.is_empty() {
