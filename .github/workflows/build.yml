@@ -9,6 +9,7 @@ on:
       - "20*"
     branches:
       - main
+      - feature/mqtts-support
     paths:
       - "**/*.rs"
       - "addon/**"
